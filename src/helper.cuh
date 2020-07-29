@@ -2,6 +2,7 @@
 
 #include <cusparse.h>
 
+#include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
 #define CHECK_CUDA(x)                                                          \
@@ -53,10 +54,10 @@ cusparseOperation_t convertTransToCusparseOperation(char trans) {
 cudaDataType getTensorCudaDataType(torch::Tensor const &self) {
   cudaDataType cuda_data_type;
   switch (self.scalar_type()) {
-  case ScalarType::Float:
+  case torch::ScalarType::Float:
     cuda_data_type = CUDA_R_32F;
     break;
-  case ScalarType::Double:
+  case torch::ScalarType::Double:
     cuda_data_type = CUDA_R_64F;
     break;
   default:

@@ -1,25 +1,43 @@
+#include "helper.cuh"
+
 #include <cusparse.h>
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAUtils.h>
 #include <torch/extension.h>
 
-Tensor _bmm_out_sparse_cuda(torch::Tensor const &rows,
-                            torch::Tensor const &cols,
-                            torch::Tensor const &vals, int64_t const dim_i,
-                            int64_t const dim_j, torch::Tensor const &mat2,
-                            bool deterministic) {
+template <typename th_int_type>
+torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
+                       torch::Tensor const &vals, int64_t const dim_i,
+                       int64_t const dim_j, torch::Tensor const &mat2,
+                       int64_t spmm_algorithm_id) {
 #if defined __HIP_PLATFORM_HCC__
-  TORCH_CHECK(false, "bmm sparse-dense is not supported on HIP");
+  TORCH_CHECK(false, "spmm sparse-dense is not supported on HIP");
 #elif defined(_WIN32) || defined(_WIN64)
-  TORCH_CHECK(false, "bmm sparse-dense CUDA is not supported on Windows");
+  TORCH_CHECK(false, "spmm sparse-dense CUDA is not supported on Windows");
 #elif defined(CUDART_VERSION) && (CUDART_VERSION >= 10010)
 
-  TORCH_CHECK(!mat2.is_sparse(), "bmm_sparse: Tensor 'mat2' must be dense");
-  TORCH_CHECK(mat2.dim() == 3,
-              "bmm_sparse: Tensor 'mat2' must have 3 dims, but has ",
+  at::ScalarType int_scalar_type = std::is_same<th_int_type, int32_t>::value
+                                       ? at::ScalarType::Int
+                                       : at::ScalarType::Long;
+
+  TORCH_CHECK(rows.scalar_type() == int_scalar_type, "int type mismatch.");
+
+  TORCH_CHECK(rows.scalar_type() == cols.scalar_type(),
+              "rows and cols must have the same scalar type.");
+  TORCH_CHECK(rows.scalar_type() == cols.scalar_type(),
+              "rows and cols must have the same scalar type.");
+  TORCH_CHECK(vals.scalar_type() == mat2.scalar_type(),
+              "vals and mat2 must have the same scalar type.");
+
+  TORCH_CHECK(rows.is_cuda(), "rows must be CUDA, but got CPU");
+  TORCH_CHECK(cols.is_cuda(), "cols must be CUDA, but got CPU");
+  TORCH_CHECK(vals.is_cuda(), "vals must be CUDA, but got CPU");
+  TORCH_CHECK(mat2.is_cuda(), "mat2 must be CUDA, but got CPU");
+  TORCH_CHECK(at::cuda::check_device({rows, cols, vals, mat2}));
+
+  TORCH_CHECK(mat2.dim() == 2, "Tensor 'mat2' must have 2 dims, but has ",
               mat2.dim());
-  TORCH_CHECK(self.size(0) == mat2.size(0),
-              "bmm_sparse: 'self.size(0)' and 'mat2.size(0)' must match");
 
   // int64_t dim_i = self.size(0);
   // int64_t dim_j = self.size(1);
@@ -32,23 +50,34 @@ Tensor _bmm_out_sparse_cuda(torch::Tensor const &rows,
   }
 
   // Dense matrices have to be contiguous for cusparseSpMM to work
-  const Tensor mat2_contig = mat2.contiguous();
+  torch::Tensor const mat2_contig = mat2.contiguous();
   auto cusparse_handle = at::cuda::getCurrentCUDASparseHandle();
 
   torch::Scalar beta = 0;
   torch::Scalar alpha = 1;
 
-  int64_t mat_el_begin_idx = 0;
   size_t workspace_buffer_size = 0;
   void *workspace_buffer = nullptr;
 
-  deterministic = deterministic || at::globalContext().deterministic();
-  cusparseSpMMAlg_t mm_alg =
-      deterministic ? CUSPARSE_COOMM_ALG2 : CUSPARSE_COOMM_ALG1;
+  cusparseSpMMAlg_t mm_alg;
+  switch (spmm_algorithm_id) {
+  case 1:
+    mm_alg = CUSPARSE_COOMM_ALG1;
+    break;
+  case 2:
+    mm_alg = CUSPARSE_COOMM_ALG2;
+    break;
+  case 3:
+    mm_alg = CUSPARSE_COOMM_ALG3;
+    break;
+  default:
+    TORCH_CHECK(false, "Invalid algorithm id.", spmm_algorithm_id);
+    mm_alg = CUSPARSE_MM_ALG_DEFAULT;
+  }
 
   // Iterate through each set of 2D matrices within the 3D
   // tensor inputs, performing a matrix multiply with each
-  AT_DISPATCH_FLOATING_TYPES(values.scalar_type(), "bmm_sparse_cuda", [&] {
+  AT_DISPATCH_FLOATING_TYPES(vals.scalar_type(), "coo_spmm", [&] {
     scalar_t alpha_val = alpha.to<scalar_t>();
     scalar_t beta_val = beta.to<scalar_t>();
 
@@ -56,9 +85,11 @@ Tensor _bmm_out_sparse_cuda(torch::Tensor const &rows,
     int64_t sparse_nnz = rows.numel();
 
     cudaDataType cuda_data_type = getTensorCudaDataType(mat2_contig);
-    uint32_t *row_indices_ptr = reinterpret_cast<uint32_t *>(rows.data_ptr());
-    uint32_t *col_indices_ptr = reinterpret_cast<uint32_t *>(cols.data_ptr());
-    scalar_t *values_ptr = reinterpret_cast<scalar_t *>(values.data_ptr());
+    th_int_type *row_indices_ptr =
+        reinterpret_cast<th_int_type *>(rows.data_ptr());
+    th_int_type *col_indices_ptr =
+        reinterpret_cast<th_int_type *>(cols.data_ptr());
+    scalar_t *values_ptr = reinterpret_cast<scalar_t *>(vals.data_ptr());
     scalar_t *mat2_ptr = reinterpret_cast<scalar_t *>(mat2_contig.data_ptr());
     scalar_t *result_ptr = reinterpret_cast<scalar_t *>(result.data_ptr());
 
@@ -69,7 +100,9 @@ Tensor _bmm_out_sparse_cuda(torch::Tensor const &rows,
         reinterpret_cast<void *>(row_indices_ptr),
         reinterpret_cast<void *>(col_indices_ptr),
         reinterpret_cast<void *>(values_ptr), //
-        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, cuda_data_type));
+        std::is_same<th_int_type, int32_t>::value ? CUSPARSE_INDEX_32I
+                                                  : CUSPARSE_INDEX_64I,
+        CUSPARSE_INDEX_BASE_ZERO, cuda_data_type));
 
     cusparseDnMatDescr_t dense_descr;
     TORCH_CUDASPARSE_CHECK(
@@ -99,11 +132,14 @@ Tensor _bmm_out_sparse_cuda(torch::Tensor const &rows,
       workspace_buffer_size = required_workspace_buffer_size;
       cudaMallocManaged(&workspace_buffer, workspace_buffer_size);
     }
-    TORCH_CUDASPARSE_CHECK(
-        cusparseSpMM(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                     CUSPARSE_OPERATION_TRANSPOSE, (void *)&alpha_val,
-                     sparse_descr, dense_descr, (void *)&beta_val, result_descr,
-                     cuda_data_type, mm_alg, workspace_buffer));
+    TORCH_CUDASPARSE_CHECK(cusparseSpMM(cusparse_handle,                  //
+                                        CUSPARSE_OPERATION_NON_TRANSPOSE, //
+                                        CUSPARSE_OPERATION_TRANSPOSE,     //
+                                        (void *)&alpha_val,               //
+                                        sparse_descr, dense_descr,        //
+                                        (void *)&beta_val, result_descr,  //
+                                        cuda_data_type, mm_alg,
+                                        workspace_buffer));
     TORCH_CUDASPARSE_CHECK(cusparseDestroySpMat(sparse_descr));
     TORCH_CUDASPARSE_CHECK(cusparseDestroyDnMat(dense_descr));
     TORCH_CUDASPARSE_CHECK(cusparseDestroyDnMat(result_descr));
@@ -119,11 +155,11 @@ Tensor _bmm_out_sparse_cuda(torch::Tensor const &rows,
 
   return result;
 #else
-  TORCH_CHECK(false, "bmm sparse-dense requires CUDA 10.1 or greater");
+  TORCH_CHECK(false, "spmm sparse-dense requires CUDA 10.1 or greater");
 #endif
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("coordinate_map_key_return", &minkowski::coordinate_map_key_return,
-        "Minkowski Engine coordinate map key return test");
+  m.def("coo_spmm_int32", &coo_spmm<int32_t>, "sparse matrix x dense matrix");
+  m.def("coo_spmm_int64", &coo_spmm<int64_t>, "sparse matrix x dense matrix");
 }

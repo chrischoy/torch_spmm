@@ -38,8 +38,6 @@ HERE = Path(os.path.dirname(__file__)).absolute()
 SRC_PATH = HERE.parent.parent / "src"
 CXX = os.environ["CXX"]
 
-assert test_target in SOURCE_SETS.keys()
-
 if sys.platform == "win32":
     vc_version = os.getenv("VCToolsVersion", "")
     if vc_version.startswith("14.16."):
@@ -47,7 +45,7 @@ if sys.platform == "win32":
     else:
         CXX_FLAGS = ["/sdl", "/permissive-"]
 else:
-    CXX_FLAGS = ["-fopenmp"]
+    CXX_FLAGS = []
 
 NVCC_FLAGS = [f"-ccbin={CXX}", "--extended-lambda"]
 
@@ -57,12 +55,6 @@ if not no_debug:
 else:
     CXX_FLAGS += ["-O3"]
     NVCC_FLAGS += ["-O3"]
-
-Extension = SOURCE_SETS[test_target][0]
-CURR_TEST_FILES = SOURCE_SETS[test_target][1:3]
-ARGS = SOURCE_SETS[test_target][3]
-CXX_FLAGS += ARGS
-NVCC_FLAGS += ARGS
 
 ext_modules = [
     CUDAExtension(

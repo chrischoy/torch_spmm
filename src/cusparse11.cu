@@ -15,7 +15,54 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
   TORCH_CHECK(false, "spmm sparse-dense is not supported on HIP");
 #elif defined(_WIN32) || defined(_WIN64)
   TORCH_CHECK(false, "spmm sparse-dense CUDA is not supported on Windows");
-#elif defined(CUDART_VERSION) && (CUDART_VERSION >= 10010)
+#elif !defined(CUDART_VERSION)
+  TORCH_CHECK(false, "CUDART_VERSION not defined");
+#endif
+
+  constexpr bool is_int32 = std::is_same<th_int_type, int64_t>::value;
+
+  cusparseSpMMAlg_t mm_alg;
+#if defined(CUDART_VERSION) && (CUDART_VERSION < 10010)
+  TORCH_CHECK(false, "spmm sparse-dense requires CUDA 10.1 or greater");
+#elif defined(CUDART_VERSION) && (CUDART_VERSION >= 10010) &&                  \
+    (CUDART_VERSION < 11000)
+  switch (spmm_algorithm_id) {
+  case 1:
+    mm_alg = CUSPARSE_COOMM_ALG1;
+    break;
+  case 2:
+    mm_alg = CUSPARSE_COOMM_ALG2;
+    break;
+  case 3:
+    mm_alg = CUSPARSE_COOMM_ALG3;
+    break;
+  default:
+    TORCH_CHECK(false, "Invalid algorithm id.", spmm_algorithm_id);
+    mm_alg = CUSPARSE_MM_ALG_DEFAULT;
+  }
+  TORCH_CHECK(!is_int32, "int64 cusparseSpMM requires CUDA 11.0 or greater");
+#elif defined(CUDART_VERSION) && (CUDART_VERSION >= 11000)
+  switch (spmm_algorithm_id) {
+  case 1:
+    mm_alg = CUSPARSE_SPMM_COO_ALG1;
+    break;
+  case 2:
+    mm_alg = CUSPARSE_SPMM_COO_ALG2;
+    break;
+  case 3:
+    mm_alg = CUSPARSE_SPMM_COO_ALG3;
+    break;
+  case 3:
+    mm_alg = CUSPARSE_SPMM_COO_ALG4;
+    break;
+  default:
+    TORCH_CHECK(false, "Invalid algorithm id.", spmm_algorithm_id);
+    mm_alg = CUSPARSE_SPMM_ALG_DEFAULT;
+  }
+  TORCH_CHECK(std::is_same<int32_t, th_int_type>::value ||
+              (std::is_same<int64_t, th_int_type>::value &&
+               (mm_alg == CUSPARSE_SPMM_COO_ALG4)));
+#endif
 
   at::ScalarType int_scalar_type = std::is_same<th_int_type, int32_t>::value
                                        ? at::ScalarType::Int
@@ -43,7 +90,7 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
   // int64_t dim_j = self.size(1);
   int64_t dim_k = mat2.size(1);
 
-  torch::Tensor result = at::zeros({dim_k, dim_i}, mat2.options());
+  torch::Tensor result = at::empty({dim_k, dim_i}, mat2.options());
 
   if ((dim_j == 0) || (dim_k == 0)) {
     return result;
@@ -58,22 +105,6 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
 
   size_t workspace_buffer_size = 0;
   void *workspace_buffer = nullptr;
-
-  cusparseSpMMAlg_t mm_alg;
-  switch (spmm_algorithm_id) {
-  case 1:
-    mm_alg = CUSPARSE_COOMM_ALG1;
-    break;
-  case 2:
-    mm_alg = CUSPARSE_COOMM_ALG2;
-    break;
-  case 3:
-    mm_alg = CUSPARSE_COOMM_ALG3;
-    break;
-  default:
-    TORCH_CHECK(false, "Invalid algorithm id.", spmm_algorithm_id);
-    mm_alg = CUSPARSE_MM_ALG_DEFAULT;
-  }
 
   // Iterate through each set of 2D matrices within the 3D
   // tensor inputs, performing a matrix multiply with each
@@ -154,9 +185,6 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
   }
 
   return result;
-#else
-  TORCH_CHECK(false, "spmm sparse-dense requires CUDA 10.1 or greater");
-#endif
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

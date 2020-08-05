@@ -36,7 +36,10 @@ no_debug, argv = _argparse("--nodebug", argv)
 USE_NINJA = os.getenv("USE_NINJA") == "0"
 HERE = Path(os.path.dirname(__file__)).absolute()
 SRC_PATH = HERE.parent.parent / "src"
-CXX = os.environ["CXX"]
+if "CXX" in os.environ:
+    CXX = os.environ["CXX"]
+else:
+    CXX = "g++"
 
 if sys.platform == "win32":
     vc_version = os.getenv("VCToolsVersion", "")

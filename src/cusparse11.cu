@@ -19,7 +19,8 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
   TORCH_CHECK(false, "CUDART_VERSION not defined");
 #endif
 
-  constexpr bool is_int32 = std::is_same<th_int_type, int64_t>::value;
+  constexpr bool is_int32 = std::is_same<th_int_type, int32_t>::value;
+  constexpr bool is_int64 = std::is_same<th_int_type, int64_t>::value;
 
   cusparseSpMMAlg_t mm_alg;
 #if defined(CUDART_VERSION) && (CUDART_VERSION < 10010)
@@ -40,7 +41,7 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
     TORCH_CHECK(false, "Invalid algorithm id.", spmm_algorithm_id);
     mm_alg = CUSPARSE_MM_ALG_DEFAULT;
   }
-  TORCH_CHECK(!is_int32, "int64 cusparseSpMM requires CUDA 11.0 or greater");
+  TORCH_CHECK(is_int32, "int64 cusparseSpMM requires CUDA 11.0 or greater");
 #elif defined(CUDART_VERSION) && (CUDART_VERSION >= 11000)
   switch (spmm_algorithm_id) {
   case 1:
@@ -52,21 +53,21 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
   case 3:
     mm_alg = CUSPARSE_SPMM_COO_ALG3;
     break;
-  case 3:
+  case 4:
+    // CUSPARSE_SPMM_CSR_ALG4 should be used with row-major layout, while
+    // CUSPARSE_SPMM_CSR_ALG1, CUSPARSE_SPMM_CSR_ALG2, and
+    // CUSPARSE_SPMM_CSR_ALG3 with column-major layout.
     mm_alg = CUSPARSE_SPMM_COO_ALG4;
     break;
   default:
     TORCH_CHECK(false, "Invalid algorithm id.", spmm_algorithm_id);
     mm_alg = CUSPARSE_SPMM_ALG_DEFAULT;
   }
-  TORCH_CHECK(std::is_same<int32_t, th_int_type>::value ||
-              (std::is_same<int64_t, th_int_type>::value &&
-               (mm_alg == CUSPARSE_SPMM_COO_ALG4)));
+  TORCH_CHECK(is_int32 || (is_int64 && (mm_alg == CUSPARSE_SPMM_COO_ALG4)));
 #endif
 
-  at::ScalarType int_scalar_type = std::is_same<th_int_type, int32_t>::value
-                                       ? at::ScalarType::Int
-                                       : at::ScalarType::Long;
+  at::ScalarType int_scalar_type =
+      is_int32 ? at::ScalarType::Int : at::ScalarType::Long;
 
   TORCH_CHECK(rows.scalar_type() == int_scalar_type, "int type mismatch.");
 
@@ -106,6 +107,10 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
   size_t workspace_buffer_size = 0;
   void *workspace_buffer = nullptr;
 
+  cusparseSpMatDescr_t sparse_descr;
+  cusparseDnMatDescr_t dense_descr;
+  cusparseDnMatDescr_t result_descr;
+
   // Iterate through each set of 2D matrices within the 3D
   // tensor inputs, performing a matrix multiply with each
   AT_DISPATCH_FLOATING_TYPES(vals.scalar_type(), "coo_spmm", [&] {
@@ -124,61 +129,105 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
     scalar_t *mat2_ptr = reinterpret_cast<scalar_t *>(mat2_contig.data_ptr());
     scalar_t *result_ptr = reinterpret_cast<scalar_t *>(result.data_ptr());
 
-    cusparseSpMatDescr_t sparse_descr;
-    TORCH_CUDASPARSE_CHECK(cusparseCreateCoo(
-        &sparse_descr,            //
-        dim_i, dim_j, sparse_nnz, //
-        reinterpret_cast<void *>(row_indices_ptr),
-        reinterpret_cast<void *>(col_indices_ptr),
-        reinterpret_cast<void *>(values_ptr), //
-        std::is_same<th_int_type, int32_t>::value ? CUSPARSE_INDEX_32I
-                                                  : CUSPARSE_INDEX_64I,
-        CUSPARSE_INDEX_BASE_ZERO, cuda_data_type));
+    if (mm_alg == CUSPARSE_SPMM_COO_ALG4) {
+      TORCH_CUDASPARSE_CHECK(cusparseCreateCoo(
+          &sparse_descr,            //
+          dim_i, dim_j, sparse_nnz, //
+          reinterpret_cast<void *>(row_indices_ptr),
+          reinterpret_cast<void *>(col_indices_ptr),
+          reinterpret_cast<void *>(values_ptr), //
+          std::is_same<th_int_type, int32_t>::value ? CUSPARSE_INDEX_32I
+                                                    : CUSPARSE_INDEX_64I,
+          CUSPARSE_INDEX_BASE_ZERO, cuda_data_type));
 
-    cusparseDnMatDescr_t dense_descr;
-    TORCH_CUDASPARSE_CHECK(
-        cusparseCreateDnMat(&dense_descr,                       //
-                            dim_k, dim_j, dim_k,                //
-                            reinterpret_cast<void *>(mat2_ptr), //
-                            cuda_data_type, CUSPARSE_ORDER_COL));
+      TORCH_CUDASPARSE_CHECK(
+          cusparseCreateDnMat(&dense_descr,                       //
+                              dim_j, dim_k, dim_j,                //
+                              reinterpret_cast<void *>(mat2_ptr), //
+                              cuda_data_type, CUSPARSE_ORDER_ROW));
 
-    cusparseDnMatDescr_t result_descr;
-    TORCH_CUDASPARSE_CHECK(
-        cusparseCreateDnMat(&result_descr,                        //
-                            dim_i, dim_k, dim_i,                  //
-                            reinterpret_cast<void *>(result_ptr), //
-                            cuda_data_type, CUSPARSE_ORDER_COL));
+      TORCH_CUDASPARSE_CHECK(
+          cusparseCreateDnMat(&result_descr,                        //
+                              dim_i, dim_k, dim_i,                  //
+                              reinterpret_cast<void *>(result_ptr), //
+                              cuda_data_type, CUSPARSE_ORDER_ROW));
 
-    size_t required_workspace_buffer_size = 0;
-    TORCH_CUDASPARSE_CHECK(cusparseSpMM_bufferSize(
-        cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        CUSPARSE_OPERATION_TRANSPOSE, (void *)&alpha_val, sparse_descr,
-        dense_descr, (void *)&beta_val, result_descr, cuda_data_type, mm_alg,
-        &required_workspace_buffer_size));
+      size_t required_workspace_buffer_size = 0;
+      TORCH_CUDASPARSE_CHECK(cusparseSpMM_bufferSize(
+          cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+          CUSPARSE_OPERATION_TRANSPOSE, (void *)&alpha_val, sparse_descr,
+          dense_descr, (void *)&beta_val, result_descr, cuda_data_type, mm_alg,
+          &required_workspace_buffer_size));
 
-    if (required_workspace_buffer_size > workspace_buffer_size) {
-      if (workspace_buffer != nullptr) {
-        cudaFree(workspace_buffer);
+      if (required_workspace_buffer_size > workspace_buffer_size) {
+        if (workspace_buffer != nullptr) {
+          cudaFree(workspace_buffer);
+        }
+        workspace_buffer_size = required_workspace_buffer_size;
+        cudaMallocManaged(&workspace_buffer, workspace_buffer_size);
       }
-      workspace_buffer_size = required_workspace_buffer_size;
-      cudaMallocManaged(&workspace_buffer, workspace_buffer_size);
+      TORCH_CUDASPARSE_CHECK(cusparseSpMM(cusparse_handle,                  //
+                                          CUSPARSE_OPERATION_NON_TRANSPOSE, //
+                                          CUSPARSE_OPERATION_NON_TRANSPOSE, //
+                                          (void *)&alpha_val,               //
+                                          sparse_descr, dense_descr,        //
+                                          (void *)&beta_val, result_descr,  //
+                                          cuda_data_type, mm_alg,
+                                          workspace_buffer));
+    } else {
+      TORCH_CUDASPARSE_CHECK(cusparseCreateCoo(
+          &sparse_descr,            //
+          dim_i, dim_j, sparse_nnz, //
+          reinterpret_cast<void *>(row_indices_ptr),
+          reinterpret_cast<void *>(col_indices_ptr),
+          reinterpret_cast<void *>(values_ptr), //
+          std::is_same<th_int_type, int32_t>::value ? CUSPARSE_INDEX_32I
+                                                    : CUSPARSE_INDEX_64I,
+          CUSPARSE_INDEX_BASE_ZERO, cuda_data_type));
+
+      TORCH_CUDASPARSE_CHECK(
+          cusparseCreateDnMat(&dense_descr,                       //
+                              dim_k, dim_j, dim_k,                //
+                              reinterpret_cast<void *>(mat2_ptr), //
+                              cuda_data_type, CUSPARSE_ORDER_COL));
+
+      TORCH_CUDASPARSE_CHECK(
+          cusparseCreateDnMat(&result_descr,                        //
+                              dim_i, dim_k, dim_i,                  //
+                              reinterpret_cast<void *>(result_ptr), //
+                              cuda_data_type, CUSPARSE_ORDER_COL));
+
+      size_t required_workspace_buffer_size = 0;
+      TORCH_CUDASPARSE_CHECK(cusparseSpMM_bufferSize(
+          cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+          CUSPARSE_OPERATION_TRANSPOSE, (void *)&alpha_val, sparse_descr,
+          dense_descr, (void *)&beta_val, result_descr, cuda_data_type, mm_alg,
+          &required_workspace_buffer_size));
+
+      if (required_workspace_buffer_size > workspace_buffer_size) {
+        if (workspace_buffer != nullptr) {
+          cudaFree(workspace_buffer);
+        }
+        workspace_buffer_size = required_workspace_buffer_size;
+        cudaMallocManaged(&workspace_buffer, workspace_buffer_size);
+      }
+      TORCH_CUDASPARSE_CHECK(cusparseSpMM(cusparse_handle,                  //
+                                          CUSPARSE_OPERATION_NON_TRANSPOSE, //
+                                          CUSPARSE_OPERATION_TRANSPOSE,     //
+                                          (void *)&alpha_val,               //
+                                          sparse_descr, dense_descr,        //
+                                          (void *)&beta_val, result_descr,  //
+                                          cuda_data_type, mm_alg,
+                                          workspace_buffer));
+      // Need to transpose the result matrices since cusparse stores
+      // them in column-major order in memory
+      result.transpose_(0, 1);
     }
-    TORCH_CUDASPARSE_CHECK(cusparseSpMM(cusparse_handle,                  //
-                                        CUSPARSE_OPERATION_NON_TRANSPOSE, //
-                                        CUSPARSE_OPERATION_TRANSPOSE,     //
-                                        (void *)&alpha_val,               //
-                                        sparse_descr, dense_descr,        //
-                                        (void *)&beta_val, result_descr,  //
-                                        cuda_data_type, mm_alg,
-                                        workspace_buffer));
-    TORCH_CUDASPARSE_CHECK(cusparseDestroySpMat(sparse_descr));
-    TORCH_CUDASPARSE_CHECK(cusparseDestroyDnMat(dense_descr));
-    TORCH_CUDASPARSE_CHECK(cusparseDestroyDnMat(result_descr));
   });
 
-  // Need to transpose the result matrices since cusparse stores
-  // them in column-major order in memory
-  result.transpose_(0, 1);
+  TORCH_CUDASPARSE_CHECK(cusparseDestroySpMat(sparse_descr));
+  TORCH_CUDASPARSE_CHECK(cusparseDestroyDnMat(dense_descr));
+  TORCH_CUDASPARSE_CHECK(cusparseDestroyDnMat(result_descr));
 
   if (workspace_buffer != nullptr) {
     cudaFree(workspace_buffer);

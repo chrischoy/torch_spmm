@@ -54,9 +54,6 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
     mm_alg = CUSPARSE_SPMM_COO_ALG3;
     break;
   case 4:
-    // CUSPARSE_SPMM_CSR_ALG4 should be used with row-major layout, while
-    // CUSPARSE_SPMM_CSR_ALG1, CUSPARSE_SPMM_CSR_ALG2, and
-    // CUSPARSE_SPMM_CSR_ALG3 with column-major layout.
     mm_alg = CUSPARSE_SPMM_COO_ALG4;
     break;
   default:
@@ -129,7 +126,13 @@ torch::Tensor coo_spmm(torch::Tensor const &rows, torch::Tensor const &cols,
     scalar_t *mat2_ptr = reinterpret_cast<scalar_t *>(mat2_contig.data_ptr());
     scalar_t *result_ptr = reinterpret_cast<scalar_t *>(result.data_ptr());
 
-    if (mm_alg == CUSPARSE_SPMM_COO_ALG4) {
+    if (
+#if defined(CUDART_VERSION) && (CUDART_VERSION >= 11000)
+        mm_alg == CUSPARSE_SPMM_COO_ALG4
+#else
+        false
+#endif
+    ) {
       TORCH_CUDASPARSE_CHECK(cusparseCreateCoo(
           &sparse_descr,            //
           dim_i, dim_j, sparse_nnz, //
